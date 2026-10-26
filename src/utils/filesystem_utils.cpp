@@ -38,6 +38,50 @@ namespace {
 // Linux requires the "user." namespace.
 constexpr std::string_view CACHE_VERSION_ATTR_KEY = "user.cache_version";
 
+#if defined(_WIN32)
+// UTF-8 to UTF-16, for the wide Windows APIs.
+std::wstring ToWide(const string &utf8) {
+	if (utf8.empty()) {
+		return std::wstring();
+	}
+	const int len = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+	std::wstring wide(static_cast<size_t>(len), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), &wide[0], len);
+	return wide;
+}
+
+// The NTFS alternate data stream [key] of [filepath], which stands in for an xattr on Windows.
+//
+// Given in extended-length form ("\\?\C:\..."), which is not bound by MAX_PATH: a cache file's path is allowed to reach
+// MAX_PATH by itself (see [GetMaxFileNameLength]), and its temporary file's name is longer still, so with ":<key>"
+// appended a plain path is routinely past 260 characters. The stream then fails to open, the attribute is not written,
+// and the cache file is silently never published.
+std::filesystem::path GetAdsPath(const string &filepath, const string &key) {
+	std::wstring path = ToWide(filepath);
+	std::replace(path.begin(), path.end(), L'/', L'\\');
+	// An extended-length path is taken literally, so it has to be absolute and normalized first.
+	const DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+	if (needed != 0) {
+		std::wstring full(needed, L'\0');
+		const DWORD written = GetFullPathNameW(path.c_str(), needed, &full[0], nullptr);
+		if (written != 0 && written < needed) {
+			full.resize(written);
+			path = std::move(full);
+		}
+	}
+	if (path.rfind(L"\\\\?\\", 0) != 0) {
+		if (path.rfind(L"\\\\", 0) == 0) {
+			path = L"\\\\?\\UNC\\" + path.substr(2);
+		} else {
+			path = L"\\\\?\\" + path;
+		}
+	}
+	path += L":";
+	path += ToWide(key);
+	return std::filesystem::path(path);
+}
+#endif
+
 // Util function to set key-value pair as the file attribute.
 bool SetSingleFileAttribute(const string &filepath, const string &key, const string &value) {
 	// Validate the requested file attribute is shorter than upper limit.
@@ -50,8 +94,7 @@ bool SetSingleFileAttribute(const string &filepath, const string &key, const str
 	}
 
 #if defined(_WIN32)
-	const string ads_path = StringUtil::Format("%s:%s", filepath, key);
-	std::ofstream ads(ads_path, std::ios::binary);
+	std::ofstream ads(GetAdsPath(filepath, key), std::ios::binary);
 	if (!ads.is_open()) {
 		return false;
 	}
@@ -225,8 +268,7 @@ bool SetCacheVersion(const string &filepath, const string &version) {
 
 string GetCacheVersion(const string &filepath) {
 #if defined(_WIN32)
-	const string ads_path = StringUtil::Format("%s:%s", filepath, string(CACHE_VERSION_ATTR_KEY));
-	std::ifstream ads(ads_path, std::ios::binary);
+	std::ifstream ads(GetAdsPath(filepath, string(CACHE_VERSION_ATTR_KEY)), std::ios::binary);
 	if (!ads.is_open()) {
 		return "";
 	}
@@ -266,8 +308,7 @@ string GetCacheVersion(const string &filepath) {
 
 string GetFileXattr(const string &filepath, const string &key) {
 #if defined(_WIN32)
-	const string ads_path = StringUtil::Format("%s:%s", filepath, key);
-	std::ifstream ads(ads_path, std::ios::binary);
+	std::ifstream ads(GetAdsPath(filepath, key), std::ios::binary);
 	if (!ads.is_open()) {
 		return "";
 	}

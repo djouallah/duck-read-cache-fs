@@ -200,6 +200,14 @@ void WrapCacheFileSystem(const DataChunk &args, ExpressionState &state, Vector &
 	auto &vfs = opener_filesystem.GetFileSystem();
 	auto internal_filesystem = vfs.ExtractSubSystem(filesystem_name);
 	if (internal_filesystem == nullptr) {
+		// Wrapping is idempotent: a filesystem already wrapped is no longer registered under its own name, only as the
+		// cache filesystem around it.
+		const auto wrapped_name = StringUtil::Format("cache_httpfs_%s", filesystem_name);
+		const auto registered = vfs.ListSubSystems();
+		if (std::find(registered.begin(), registered.end(), wrapped_name) != registered.end()) {
+			result.Reference(Value(SUCCESS), count_t(args.size()));
+			return;
+		}
 		throw InvalidInputException("Filesystem %s hasn't been registered yet! Use "
 		                            "cache_httpfs_list_registered_filesystems() to see available filesystems.",
 		                            filesystem_name);
@@ -311,9 +319,13 @@ void RegisterCacheHttpfsFunctions(ExtensionLoader &loader) {
 	// D. LOAD azure;
 	// -- Wrap filesystem with its name.
 	// D. SELECT cache_httpfs_wrap_cache_filesystem('AzureBlobStorageFileSystem');
-	RegisterScalarFunction(loader,
-	                       ScalarFunction("cache_httpfs_wrap_cache_filesystem", {LogicalType::VARCHAR},
-	                                      LogicalType::BOOLEAN, WrapCacheFileSystem),
+	//
+	// Volatile, since it changes the instance's filesystems: a constant call must not be folded at plan time and then
+	// executed again.
+	ScalarFunction wrap_cache_filesystem_func("cache_httpfs_wrap_cache_filesystem", {LogicalType::VARCHAR},
+	                                          LogicalType::BOOLEAN, WrapCacheFileSystem);
+	wrap_cache_filesystem_func.SetVolatile();
+	RegisterScalarFunction(loader, std::move(wrap_cache_filesystem_func),
 	                       /*parameter_names=*/ {"filesystem_name"},
 	                       /*description=*/"Wraps a registered DuckDB filesystem with the cache filesystem.",
 	                       /*examples=*/ {"SELECT cache_httpfs_wrap_cache_filesystem('AzureBlobStorageFileSystem');"},
