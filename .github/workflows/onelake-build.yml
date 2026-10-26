@@ -1,0 +1,53 @@
+# Fork-only: builds cache_httpfs for the platforms OneLake Studio ships, with the fixes on this branch, until they are
+# released upstream. Not part of any upstream pull request.
+#
+# Every push builds and tests. A tag onelake-* also publishes the binaries as a GitHub release, which OneLake Studio's
+# fetch-extensions.mjs downloads into each platform's vsix.
+name: OneLake Studio build
+
+on:
+  push:
+    branches: [fix/windows-long-path-xattr]
+    tags: ['onelake-*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
+    with:
+      duckdb_version: v2.0.0
+      ci_tools_version: v2.0-cyanoptera
+      extension_name: cache_httpfs
+      # Only what OneLake Studio ships: x64 and arm64 on Windows, macOS and Linux (glibc).
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;linux_amd64_musl;linux_arm64_musl'
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/onelake-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: One file per platform
+        run: |
+          mkdir out
+          for f in $(find artifacts -name 'cache_httpfs.duckdb_extension'); do
+            dir=$(basename "$(dirname "$f")")              # e.g. cache_httpfs-v2.0.0-extension-windows_amd64
+            platform=${dir##*-extension-}
+            cp "$f" "out/cache_httpfs.${platform}.duckdb_extension"
+          done
+          ls -la out
+          test "$(ls out | wc -l)" -ge 6
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" out/* --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}" --notes "cache_httpfs for DuckDB v2.0.0 with the Windows long-path and idempotent-wrap fixes, built from ${GITHUB_SHA}."
