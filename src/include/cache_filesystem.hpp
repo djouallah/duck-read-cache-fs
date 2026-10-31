@@ -11,7 +11,9 @@
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "exclusive_multi_lru_cache.hpp"
+#include "offline_file.hpp"
 #include "shared_value_lru_cache.hpp"
 #include "duckdb/common/thread_annotation.hpp"
 
@@ -57,7 +59,7 @@ public:
 	// file handle cache. So for read handle, we simply do nothing.
 	void Close() override;
 
-	// Get internal filesystem for cache filesystem.
+	// Get internal filesystem for cache filesystem: the one that can read [internal_file_handle].
 	FileSystem *GetInternalFileSystem() const;
 
 	// Get version tag.
@@ -71,6 +73,8 @@ public:
 	unique_ptr<FileHandle> internal_file_handle;
 	std::function<void(CacheFileSystemHandle &)> dtor_callback;
 	connection_t connection_id;
+	// Opened with no network: [internal_file_handle] is an OfflineFileHandle.
+	bool offline = false;
 };
 
 class CacheFileSystem : public FileSystem {
@@ -139,15 +143,13 @@ public:
 	}
 	FileType GetFileType(FileHandle &handle) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-		return internal_filesystem->GetFileType(*disk_cache_handle.internal_file_handle);
+		return disk_cache_handle.GetInternalFileSystem()->GetFileType(*disk_cache_handle.internal_file_handle);
 	}
 	void Truncate(FileHandle &handle, int64_t new_size) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
 		return internal_filesystem->Truncate(*disk_cache_handle.internal_file_handle, new_size);
 	}
-	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
-		return internal_filesystem->DirectoryExists(directory, opener);
-	}
+	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void CreateDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override {
 		internal_filesystem->CreateDirectory(directory, opener);
 	}
@@ -160,9 +162,7 @@ public:
 	void MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener = nullptr) override {
 		internal_filesystem->MoveFile(source, target, opener);
 	}
-	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
-		return internal_filesystem->FileExists(filename, opener);
-	}
+	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool IsPipe(const string &filename, optional_ptr<FileOpener> opener = nullptr) override {
 		return internal_filesystem->IsPipe(filename, opener);
 	}
@@ -196,15 +196,15 @@ public:
 	bool CanHandleFile(const string &fpath) override;
 	void Seek(FileHandle &handle, idx_t location) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-		internal_filesystem->Seek(*disk_cache_handle.internal_file_handle, location);
+		disk_cache_handle.GetInternalFileSystem()->Seek(*disk_cache_handle.internal_file_handle, location);
 	}
 	void Reset(FileHandle &handle) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-		internal_filesystem->Reset(*disk_cache_handle.internal_file_handle);
+		disk_cache_handle.GetInternalFileSystem()->Reset(*disk_cache_handle.internal_file_handle);
 	}
 	idx_t SeekPosition(FileHandle &handle) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-		return internal_filesystem->SeekPosition(*disk_cache_handle.internal_file_handle);
+		return disk_cache_handle.GetInternalFileSystem()->SeekPosition(*disk_cache_handle.internal_file_handle);
 	}
 	bool IsManuallySet() override;
 	bool CanSeek() override {
@@ -212,7 +212,7 @@ public:
 	}
 	bool OnDiskFile(FileHandle &handle) override {
 		auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-		return internal_filesystem->OnDiskFile(*disk_cache_handle.internal_file_handle);
+		return disk_cache_handle.GetInternalFileSystem()->OnDiskFile(*disk_cache_handle.internal_file_handle);
 	}
 	void SetDisabledFileSystems(const vector<string> &names) override {
 		internal_filesystem->SetDisabledFileSystems(names);
@@ -297,6 +297,12 @@ private:
 	unique_ptr<FileHandle> GetOrCreateFileHandleForRead(const OpenFileInfo &file, FileOpenFlags flags,
 	                                                    optional_ptr<FileOpener> opener);
 
+	// Open a file from what the on-disk cache keeps, with no call to [internal_filesystem].
+	unique_ptr<FileHandle> OpenOffline(const OpenFileInfo &file, FileOpenFlags flags, connection_t conn_id);
+
+	// Keep what opening a file answered, once per file and version in this process.
+	void KeepFileFacts(FileHandle &internal_handle);
+
 	// Record cache access for the given connection, resolving the profile collector internally.
 	void RecordCacheAccess(connection_t conn_id, CacheEntity cache_entity, CacheAccess cache_access);
 	void RecordCacheAccess(connection_t conn_id, CacheEntity cache_entity, CacheAccess cache_access, idx_t byte_count);
@@ -320,6 +326,11 @@ private:
 	// Glob cache, which maps from file path to filenames.
 	using GlobCache = ThreadSafeSharedValueLruConstCache<string, vector<OpenFileInfo>>;
 	unique_ptr<GlobCache> glob_cache;
+	// Answers for handles opened offline.
+	unique_ptr<OfflineFileSystem> offline_filesystem;
+	// The version tag last kept per file.
+	concurrency::mutex kept_facts_mutex;
+	unordered_map<string, string> kept_facts DUCKDB_GUARDED_BY(kept_facts_mutex);
 	// Per-instance state (shared ownership keeps state alive until all CacheFileSystems are destroyed)
 	weak_ptr<CacheHttpfsInstanceState> instance_state;
 };

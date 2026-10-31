@@ -54,6 +54,7 @@ set(EXTENSION_SOURCES
     src/cache_read_chunk.cpp
     src/disk_cache_reader.cpp
     src/disk_cache_util.cpp
+    src/offline_file.cpp
     src/extension_bounded_data_cache_storage.cpp
     src/extension_config_query_function.cpp
     src/in_mem_cache_block.cpp

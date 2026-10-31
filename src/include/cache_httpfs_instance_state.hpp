@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <string_view>
 
 #include "base_cache_reader.hpp"
@@ -180,6 +181,10 @@ struct CacheHttpfsInstanceState : public ObjectCacheEntry {
 	InstanceCacheReaderManager cache_reader_manager;
 	InstanceProfileCollectorManager profile_collector_manager;
 	CacheExclusionManager exclusion_manager;
+	// Set by cache_httpfs_set_offline: opening a file never reaches the real filesystem (offline_file.hpp).
+	std::atomic<bool> offline {false};
+	// Set the first time cache_httpfs_set_offline is called: what a file's open answered is kept from then on.
+	std::atomic<bool> keep_file_facts {false};
 
 	CacheHttpfsInstanceState() = default;
 	~CacheHttpfsInstanceState() override;

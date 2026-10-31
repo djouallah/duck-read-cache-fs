@@ -55,6 +55,9 @@ CacheFileSystemHandle::CacheFileSystemHandle(unique_ptr<FileHandle> internal_fil
 }
 
 FileSystem *CacheFileSystemHandle::GetInternalFileSystem() const {
+	if (offline) {
+		return &internal_file_handle->file_system;
+	}
 	auto &cache_filesystem = file_system.Cast<CacheFileSystem>();
 	return cache_filesystem.GetInternalFileSystem();
 }
@@ -78,7 +81,8 @@ void CacheFileSystemHandle::Close() {
 
 CacheFileSystem::CacheFileSystem(unique_ptr<FileSystem> internal_filesystem_p,
                                  weak_ptr<CacheHttpfsInstanceState> instance_state_p)
-    : internal_filesystem(std::move(internal_filesystem_p)), instance_state(std::move(instance_state_p)) {
+    : internal_filesystem(std::move(internal_filesystem_p)), offline_filesystem(make_uniq<OfflineFileSystem>()),
+      instance_state(std::move(instance_state_p)) {
 	auto state = instance_state.lock();
 	if (!state) {
 		throw InternalException("CacheFileSystem: instance state is no longer valid during construction");
@@ -106,7 +110,26 @@ bool CacheFileSystem::ListFiles(const string &directory, const std::function<voi
 bool CacheFileSystem::ListFilesExtended(const string &directory,
                                         const std::function<void(OpenFileInfo &info)> &callback,
                                         optional_ptr<FileOpener> opener) {
+	if (instance_state.lock()->offline) {
+		ThrowNotCached(directory);
+	}
 	return internal_filesystem->ListFiles(directory, callback, opener);
+}
+
+bool CacheFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
+	if (instance_state.lock()->offline) {
+		return false;
+	}
+	return internal_filesystem->DirectoryExists(directory, opener);
+}
+
+bool CacheFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
+	auto state = instance_state.lock();
+	if (state->offline) {
+		KeptFileFacts facts;
+		return TryReadKeptFileFacts(state->config, filename, facts);
+	}
+	return internal_filesystem->FileExists(filename, opener);
 }
 
 void CacheFileSystem::SetMetadataCache() {
@@ -199,6 +222,10 @@ void CacheFileSystem::SetFileHandleCache() {
 }
 
 void CacheFileSystem::ClearCache() {
+	{
+		const concurrency::lock_guard<concurrency::mutex> lck(kept_facts_mutex);
+		kept_facts.clear();
+	}
 	if (metadata_cache != nullptr) {
 		metadata_cache->Clear();
 	}
@@ -225,6 +252,10 @@ void CacheFileSystem::ClearCache(const string &filepath, connection_t conn_id) {
 	auto state = instance_state.lock();
 	auto &collector = GetProfileCollectorOrThrow(state, conn_id);
 	const auto latency_guard = collector.RecordOperationStart(IoOperation::kFilePathCacheClear);
+	{
+		const concurrency::lock_guard<concurrency::mutex> lck(kept_facts_mutex);
+		kept_facts.erase(filepath);
+	}
 	if (metadata_cache != nullptr) {
 		metadata_cache->Clear(filepath, [&filepath](const string &key) { return key == filepath; });
 	}
@@ -323,6 +354,9 @@ unique_ptr<FileHandle> CacheFileSystem::CreateCacheFileHandleForRead(unique_ptr<
 
 FileMetadata CacheFileSystem::Stats(FileHandle &handle) {
 	auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
+	if (disk_cache_handle.offline) {
+		return disk_cache_handle.GetInternalFileSystem()->Stats(*disk_cache_handle.internal_file_handle);
+	}
 
 	// Stat without cache involved.
 	if (metadata_cache == nullptr) {
@@ -425,6 +459,15 @@ vector<OpenFileInfo> CacheFileSystem::GlobImpl(const string &path, FileOpener *o
 vector<OpenFileInfo> CacheFileSystem::Glob(const string &path, FileOpener *opener) {
 	auto conn_id = GetConnectionId(opener);
 	InitializeGlobalConfig(opener);
+	if (instance_state.lock()->offline) {
+		// A plain path is its own answer, and opening it says whether it's kept. A wildcard can't be listed.
+		if (FileSystem::HasGlob(path)) {
+			ThrowNotCached(path);
+		}
+		vector<OpenFileInfo> plain_path;
+		plain_path.emplace_back(path);
+		return plain_path;
+	}
 	if (glob_cache == nullptr) {
 		return GlobImpl(path, opener);
 	}
@@ -448,7 +491,7 @@ vector<OpenFileInfo> CacheFileSystem::Glob(const string &path, FileOpener *opene
 
 string CacheFileSystem::GetVersionTag(FileHandle &handle) {
 	auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
-	return internal_filesystem->GetVersionTag(*disk_cache_handle.internal_file_handle);
+	return disk_cache_handle.GetInternalFileSystem()->GetVersionTag(*disk_cache_handle.internal_file_handle);
 }
 
 // TODO(hjiang): remove the function and switch to extension setting callback.
@@ -472,6 +515,10 @@ unique_ptr<FileHandle> CacheFileSystem::GetOrCreateFileHandleForRead(const OpenF
 	auto conn_id = GetConnectionId(opener);
 	auto state = instance_state.lock();
 	auto &collector = GetProfileCollectorOrThrow(state, conn_id);
+
+	if (state->offline) {
+		return OpenOffline(file, flags, conn_id);
+	}
 
 	// Cache is exclusive, so we don't need to acquire lock for avoid repeated access.
 	if (file_handle_cache != nullptr) {
@@ -499,7 +546,52 @@ unique_ptr<FileHandle> CacheFileSystem::GetOrCreateFileHandleForRead(const OpenF
 	const auto latency_guard = collector.RecordOperationStart(IoOperation::kOpen);
 	auto file_handle = internal_filesystem->OpenFile(file, flags | FileOpenFlags::FILE_FLAGS_PARALLEL_ACCESS, opener);
 	DUCKDB_LOG_OPEN_CACHE_MISS_PTR((file_handle));
+	if (file_handle != nullptr && state->keep_file_facts) {
+		KeepFileFacts(*file_handle);
+	}
 	return CreateCacheFileHandleForRead(std::move(file_handle), conn_id);
+}
+
+unique_ptr<FileHandle> CacheFileSystem::OpenOffline(const OpenFileInfo &file, FileOpenFlags flags,
+                                                    connection_t conn_id) {
+	auto state = instance_state.lock();
+	KeptFileFacts facts;
+	if (!TryReadKeptFileFacts(state->config, file.path, facts)) {
+		if (flags.ReturnNullIfNotExists()) {
+			return nullptr;
+		}
+		ThrowNotCached(file.path);
+	}
+	auto offline_handle = make_uniq<OfflineFileHandle>(*offline_filesystem, file.path,
+	                                                   flags | FileOpenFlags::FILE_FLAGS_PARALLEL_ACCESS, std::move(facts));
+	// Never goes back to the file handle cache, which holds only what the real filesystem can read.
+	auto cache_handle = make_uniq<CacheFileSystemHandle>(
+	    std::move(offline_handle), *this,
+	    /*dtor_callback=*/[](CacheFileSystemHandle & /*unused*/) {}, conn_id);
+	cache_handle->offline = true;
+	return std::move(cache_handle);
+}
+
+void CacheFileSystem::KeepFileFacts(FileHandle &internal_handle) {
+	auto state = instance_state.lock();
+	const string path = internal_handle.GetPath();
+	try {
+		KeptFileFacts facts;
+		facts.file_size = internal_filesystem->GetFileSize(internal_handle);
+		facts.last_modification_time = internal_filesystem->GetLastModifiedTime(internal_handle);
+		facts.version_tag = internal_filesystem->GetVersionTag(internal_handle);
+		{
+			const concurrency::lock_guard<concurrency::mutex> lck(kept_facts_mutex);
+			auto known = kept_facts.find(path);
+			if (known != kept_facts.end() && known->second == facts.version_tag) {
+				return;
+			}
+			kept_facts[path] = facts.version_tag;
+		}
+		StoreKeptFileFacts(state->config, path, facts);
+	} catch (const std::exception &) {
+		// An online read must not fail for this. The file just won't open offline.
+	}
 }
 
 // If the target file is compressed, here we only read and potentially cache compressed content.
@@ -553,6 +645,9 @@ int64_t CacheFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes
 
 timestamp_t CacheFileSystem::GetLastModifiedTime(FileHandle &handle) {
 	auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
+	if (disk_cache_handle.offline) {
+		return disk_cache_handle.GetInternalFileSystem()->GetLastModifiedTime(*disk_cache_handle.internal_file_handle);
+	}
 
 	// Stat without cache involved.
 	if (metadata_cache == nullptr) {
@@ -578,6 +673,9 @@ timestamp_t CacheFileSystem::GetLastModifiedTime(FileHandle &handle) {
 }
 int64_t CacheFileSystem::GetFileSize(FileHandle &handle) {
 	auto &disk_cache_handle = handle.Cast<CacheFileSystemHandle>();
+	if (disk_cache_handle.offline) {
+		return disk_cache_handle.GetInternalFileSystem()->GetFileSize(*disk_cache_handle.internal_file_handle);
+	}
 
 	// Stat without cache involved.
 	if (metadata_cache == nullptr) {
@@ -615,7 +713,7 @@ int64_t CacheFileSystem::ReadImpl(FileHandle &handle, void *buffer, int64_t nr_b
 	const int64_t bytes_to_read = MinValue<int64_t>(nr_bytes, file_size - location);
 	if (state->exclusion_manager.MatchAnyExclusion(handle.GetPath())) {
 		auto &cache_handle = handle.Cast<CacheFileSystemHandle>();
-		internal_filesystem->Read(*cache_handle.internal_file_handle, buffer, bytes_to_read, location);
+		cache_handle.GetInternalFileSystem()->Read(*cache_handle.internal_file_handle, buffer, bytes_to_read, location);
 		return bytes_to_read;
 	}
 

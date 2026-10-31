@@ -190,6 +190,15 @@ void ResetProfileStats(const DataChunk &args, ExpressionState &state, Vector &re
 
 // Wrap the filesystem with extension cache filesystem.
 // Throw exception if the requested filesystem hasn't been registered into duckdb instance.
+void SetOffline(const DataChunk &args, ExpressionState &state, Vector &result) {
+	ALWAYS_ASSERT(args.ColumnCount() == 1);
+	const bool offline = args.GetValue(/*col_idx=*/0, /*index=*/0).GetValue<bool>();
+	auto &instance_state = GetInstanceStateOrThrow(GetDatabaseInstance(state));
+	instance_state.keep_file_facts = true;
+	instance_state.offline = offline;
+	result.Reference(Value(SUCCESS), count_t(args.size()));
+}
+
 void WrapCacheFileSystem(const DataChunk &args, ExpressionState &state, Vector &result) {
 	ALWAYS_ASSERT(args.ColumnCount() == 1);
 	const string filesystem_name = args.GetValue(/*col_idx=*/0, /*index=*/0).ToString();
@@ -330,6 +339,18 @@ void RegisterCacheHttpfsFunctions(ExtensionLoader &loader) {
 	                       /*description=*/"Wraps a registered DuckDB filesystem with the cache filesystem.",
 	                       /*examples=*/ {"SELECT cache_httpfs_wrap_cache_filesystem('AzureBlobStorageFileSystem');"},
 	                       /*categories=*/ {"cache_httpfs", "filesystem"});
+
+	// Register the offline switch. A function rather than a setting, so it still works under lock_configuration.
+	// Volatile, since it changes the instance's state, as wrapping does.
+	ScalarFunction set_offline_func("cache_httpfs_set_offline", {LogicalType::BOOLEAN}, LogicalType::BOOLEAN, SetOffline);
+	set_offline_func.SetVolatile();
+	RegisterScalarFunction(loader, std::move(set_offline_func),
+	                       /*parameter_names=*/ {"offline"},
+	                       /*description=*/
+	                       "Serves reads from the on-disk cache only, with no call to the wrapped filesystem. Any call "
+	                       "also starts keeping what opening a file answers, which an offline open needs.",
+	                       /*examples=*/ {"SELECT cache_httpfs_set_offline(true);"},
+	                       /*categories=*/ {"cache_httpfs", "configuration"});
 
 	// Register dead temporary cache file cleanup function.
 	RegisterScalarFunction(loader,

@@ -1,0 +1,107 @@
+# name: test/sql/offline.test
+# description: offline, what was read is served from the on-disk cache, and what wasn't says so, without the real filesystem.
+# group: [sql]
+
+require notwindows
+
+require cache_httpfs
+
+require parquet
+
+statement ok
+SET cache_httpfs_type = 'on_disk';
+
+statement ok
+SET cache_httpfs_cache_directory = '__TEST_DIR__/offline_cache';
+
+statement ok
+SET cache_httpfs_enable_cache_validation = true;
+
+# Only the disk can answer below: nothing kept in memory, by either cache.
+statement ok
+SET cache_httpfs_disk_cache_reader_enable_memory_cache = false;
+
+statement ok
+SET enable_external_file_cache = false;
+
+statement ok
+SELECT cache_httpfs_wrap_cache_filesystem('cache_httpfs_fake_filesystem');
+
+statement ok
+SELECT cache_httpfs_clear_cache();
+
+# Two columns big enough that reading one leaves most of the other unread.
+statement ok
+COPY (SELECT range AS a, hash(range) AS b FROM range(500000)) TO '/tmp/cache_httpfs_fake_filesystem/offline_read.parquet' (ROW_GROUP_SIZE 500000);
+
+# Written, so the real filesystem has it, and never read.
+statement ok
+COPY (SELECT 1 AS a) TO '/tmp/cache_httpfs_fake_filesystem/offline_unread.parquet';
+
+statement ok
+SELECT cache_httpfs_clear_cache();
+
+# Any call starts keeping what an open answers, so this one comes before the read.
+query I
+SELECT cache_httpfs_set_offline(false);
+----
+true
+
+query I
+SELECT sum(a) FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_read.parquet');
+----
+124999750000
+
+statement ok
+SELECT cache_httpfs_set_offline(true);
+
+# What was read reads the same.
+query I
+SELECT sum(a) FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_read.parquet');
+----
+124999750000
+
+query I
+SELECT count(*) FROM glob('/tmp/cache_httpfs_fake_filesystem/offline_read.parquet');
+----
+1
+
+# The column never read isn't there.
+statement error
+SELECT sum(b::HUGEINT) FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_read.parquet');
+----
+is not cached on this machine
+
+# The file never read is there on disk, and is still refused: the real filesystem isn't asked.
+statement error
+SELECT * FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_unread.parquet');
+----
+is not cached on this machine
+
+statement error
+SELECT * FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_*.parquet');
+----
+is not cached on this machine
+
+# Back online, it reads, and reading it keeps it.
+statement ok
+SELECT cache_httpfs_set_offline(false);
+
+query I
+SELECT count(*) FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_unread.parquet');
+----
+1
+
+statement ok
+SELECT cache_httpfs_set_offline(true);
+
+query I
+SELECT count(*) FROM read_parquet('/tmp/cache_httpfs_fake_filesystem/offline_unread.parquet');
+----
+1
+
+statement ok
+SELECT cache_httpfs_set_offline(false);
+
+statement ok
+SELECT cache_httpfs_clear_cache();
