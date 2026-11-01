@@ -233,6 +233,9 @@ protected:
 private:
 	friend class CacheFileSystemHandle;
 
+	// Throws if [path] is an Azure path naming a host that isn't allowed (cache_httpfs_allowed_azure_hosts).
+	void CheckHost(const string &path);
+
 	struct FileHandleCacheKey {
 		string path;
 		FileOpenFlags flags; // flags have parallel access enabled.

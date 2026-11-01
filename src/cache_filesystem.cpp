@@ -18,6 +18,26 @@ constexpr std::string_view FILE_SIZE_INFO_KEY = "file_size";
 // For certain filesystems, file open info contains "last_modified" field in the extended stats map.
 constexpr std::string_view LAST_MOD_TIMESTAMP_KEY = "last_modified";
 
+// The host an Azure path names, lower case, or nothing if it names none: any other path, or a bare container (az://c/x).
+string AzureHostOf(const string &path) {
+	const auto scheme_end = path.find("://");
+	if (scheme_end == string::npos) {
+		return "";
+	}
+	const auto scheme = StringUtil::Lower(path.substr(0, scheme_end));
+	if (scheme != "abfss" && scheme != "abfs" && scheme != "az" && scheme != "azure") {
+		return "";
+	}
+	const auto begin = scheme_end + 3;
+	const auto end = path.find('/', begin);
+	auto authority = path.substr(begin, end == string::npos ? string::npos : end - begin);
+	const auto at = authority.rfind('@');
+	if (at != string::npos) {
+		authority = authority.substr(at + 1);
+	}
+	return authority.find('.') == string::npos ? "" : StringUtil::Lower(authority);
+}
+
 connection_t GetConnectionId(optional_ptr<FileOpener> opener) {
 	if (!opener) {
 		return DConstants::INVALID_INDEX;
@@ -107,9 +127,28 @@ bool CacheFileSystem::ListFiles(const string &directory, const std::function<voi
 	return ListFilesExtended(directory, wrapped_callback, opener);
 }
 
+void CacheFileSystem::CheckHost(const string &path) {
+	auto state = instance_state.lock();
+	const auto &allowed = state->config.allowed_azure_hosts;
+	if (allowed.empty()) {
+		return;
+	}
+	const auto host = AzureHostOf(path);
+	if (host.empty()) {
+		return;
+	}
+	for (const auto &one : allowed) {
+		if (host == one || StringUtil::EndsWith(host, "." + one) || StringUtil::EndsWith(host, "-" + one)) {
+			return;
+		}
+	}
+	throw PermissionException("Cannot access \"%s\": %s is not a host this database may reach", path, host);
+}
+
 bool CacheFileSystem::ListFilesExtended(const string &directory,
                                         const std::function<void(OpenFileInfo &info)> &callback,
                                         optional_ptr<FileOpener> opener) {
+	CheckHost(directory);
 	if (instance_state.lock()->offline) {
 		ThrowNotCached(directory);
 	}
@@ -117,6 +156,7 @@ bool CacheFileSystem::ListFilesExtended(const string &directory,
 }
 
 bool CacheFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
+	CheckHost(directory);
 	if (instance_state.lock()->offline) {
 		return false;
 	}
@@ -124,6 +164,7 @@ bool CacheFileSystem::DirectoryExists(const string &directory, optional_ptr<File
 }
 
 bool CacheFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
+	CheckHost(filename);
 	auto state = instance_state.lock();
 	if (state->offline) {
 		KeptFileFacts facts;
@@ -457,6 +498,7 @@ vector<OpenFileInfo> CacheFileSystem::GlobImpl(const string &path, FileOpener *o
 }
 
 vector<OpenFileInfo> CacheFileSystem::Glob(const string &path, FileOpener *opener) {
+	CheckHost(path);
 	auto conn_id = GetConnectionId(opener);
 	InitializeGlobalConfig(opener);
 	if (instance_state.lock()->offline) {
@@ -599,6 +641,7 @@ void CacheFileSystem::KeepFileFacts(FileHandle &internal_handle) {
 // Same strategy applies for duckdb internal "external file cache".
 unique_ptr<FileHandle> CacheFileSystem::OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
                                                          optional_ptr<FileOpener> opener) {
+	CheckHost(file.path);
 	InitializeGlobalConfig(opener);
 
 	// If setting has already been specified to clear cache, we clear it only once at file open.

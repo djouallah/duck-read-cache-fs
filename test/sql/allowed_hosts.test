@@ -1,0 +1,68 @@
+# name: test/sql/allowed_hosts.test
+# description: an Azure path naming a host that isn't allowed is refused before anything is asked of it.
+# group: [sql]
+
+require cache_httpfs
+
+require azure
+
+statement ok
+SELECT cache_httpfs_wrap_cache_filesystem('AzureDfsStorageFileSystem');
+
+statement ok
+SET cache_httpfs_allowed_azure_hosts = 'allowed.invalid, Second.invalid';
+
+statement error
+SELECT * FROM read_text('abfss://container@other.invalid/x.txt');
+----
+<REGEX>:.*other\.invalid is not a host this database may reach.*
+
+statement error
+SELECT * FROM read_text('ABFSS://container@OTHER.invalid/x.txt');
+----
+<REGEX>:.*other\.invalid is not a host this database may reach.*
+
+# Almost the name of one that is.
+statement error
+SELECT * FROM read_text('abfss://container@notallowed.invalid/x.txt');
+----
+<REGEX>:.*notallowed\.invalid is not a host this database may reach.*
+
+statement error
+SELECT * FROM read_text('abfss://container@allowed.invalid.other.invalid/x.txt');
+----
+<REGEX>:.*is not a host this database may reach.*
+
+# Past the check: these fail for having no such host, not for being refused.
+statement error
+SELECT * FROM read_text('abfss://container@allowed.invalid/x.txt');
+----
+<REGEX>:^(?!.*not a host this database may reach).*$
+
+statement error
+SELECT * FROM read_text('abfss://container@region-second.invalid/x.txt');
+----
+<REGEX>:^(?!.*not a host this database may reach).*$
+
+# A local path names no host, and neither does any other scheme for this.
+statement ok
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/allowed_hosts.csv';
+
+query I
+SELECT a FROM read_csv('__TEST_DIR__/allowed_hosts.csv');
+----
+1
+
+statement error
+SELECT * FROM read_text('https://other.invalid/x.txt');
+----
+<REGEX>:^(?!.*not a host this database may reach).*$
+
+# Empty is any.
+statement ok
+SET cache_httpfs_allowed_azure_hosts = '';
+
+statement error
+SELECT * FROM read_text('abfss://container@other.invalid/x.txt');
+----
+<REGEX>:^(?!.*not a host this database may reach).*$

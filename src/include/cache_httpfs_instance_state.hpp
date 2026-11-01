@@ -160,6 +160,9 @@ struct InstanceConfig {
 	// Cache invalidation on write config
 	bool clear_cache_on_write = DEFAULT_CLEAR_CACHE_ON_WRITE;
 
+	// The hosts an Azure path may name, lower case. Empty is any.
+	vector<string> allowed_azure_hosts;
+
 	// Parallel read executor mode: "internal_thread_pool" or "duckdb_task_scheduler".
 	ParallelExecutorMode parallel_read_mode = ParallelExecutorMode::INTERNAL_THREAD_POOL;
 };

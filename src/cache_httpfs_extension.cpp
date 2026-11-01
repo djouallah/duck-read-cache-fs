@@ -616,6 +616,18 @@ void UpdateEnableCacheValidation(ClientContext &context, SetScope scope, Value &
 	inst_state.config.enable_cache_validation = parameter.GetValue<bool>();
 }
 
+void UpdateAllowedAzureHosts(ClientContext &context, SetScope scope, Value &parameter) {
+	auto &inst_state = GetInstanceStateOrThrow(context);
+	vector<string> hosts;
+	for (auto &host : StringUtil::Split(parameter.ToString(), ',')) {
+		StringUtil::Trim(host);
+		if (!host.empty()) {
+			hosts.emplace_back(StringUtil::Lower(host));
+		}
+	}
+	inst_state.config.allowed_azure_hosts = std::move(hosts);
+}
+
 void UpdateClearCacheOnWrite(ClientContext &context, SetScope scope, Value &parameter) {
 	auto &inst_state = GetInstanceStateOrThrow(context);
 	inst_state.config.clear_cache_on_write = parameter.GetValue<bool>();
@@ -957,6 +969,13 @@ void LoadInternal(ExtensionLoader &loader) {
 	                          "When enabled, cache entries are validated against the current file version tag and "
 	                          "modification timestamp to ensure cache consistency. By default disabled.",
 	                          LogicalTypeId::BOOLEAN, DEFAULT_ENABLE_CACHE_VALIDATION, UpdateEnableCacheValidation);
+
+	// An Azure secret goes with any path its scope matches, whatever the host. Under lock_configuration this can't be
+	// undone.
+	config.AddExtensionOption("cache_httpfs_allowed_azure_hosts",
+	                          "The hosts an abfss://, abfs://, az:// or azure:// path may name, comma separated, each "
+	                          "also matching <prefix>-<host> and <prefix>.<host>. Empty, the default, is any.",
+	                          LogicalType {LogicalTypeId::VARCHAR}, Value(""), UpdateAllowedAzureHosts);
 
 	// Cache invalidation on write config.
 	config.AddExtensionOption(
