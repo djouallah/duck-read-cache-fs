@@ -32,6 +32,7 @@
 #include "filesystem_status_query_function.hpp"
 #include "hffs.hpp"
 #include "httpfs_extension.hpp"
+#include "mount_filesystem.hpp"
 #include "s3/s3fs.hpp"
 
 namespace duckdb {
@@ -199,6 +200,33 @@ void SetOffline(const DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value(SUCCESS), count_t(args.size()));
 }
 
+// Serve paths under a local prefix from a remote one. The filesystem is registered by the first mount, so nothing
+// changes until there is one. It reads past the checks on what the database may open, as what it opens is the
+// resolved path, so what a mount points at is checked here.
+void Mount(const DataChunk &args, ExpressionState &state, Vector &result) {
+	ALWAYS_ASSERT(args.ColumnCount() == 2);
+	const string local_prefix = args.GetValue(/*col_idx=*/0, /*index=*/0).ToString();
+	const string remote_prefix = args.GetValue(/*col_idx=*/1, /*index=*/0).ToString();
+	auto &duckdb_instance = GetDatabaseInstance(state);
+	if (!DBConfig::GetConfig(duckdb_instance).CanAccessFile(remote_prefix, FileType::FILE_TYPE_DIR)) {
+		throw PermissionException("Mounting \"%s\" is not allowed by the configuration", remote_prefix);
+	}
+	auto &instance_state = GetInstanceStateOrThrow(duckdb_instance);
+	instance_state.mount_table->Add(local_prefix, remote_prefix);
+	if (instance_state.mount_table->FirstUse()) {
+		auto &vfs = duckdb_instance.GetFileSystem().Cast<OpenerFileSystem>().GetFileSystem();
+		vfs.RegisterSubSystem(make_uniq<MountFileSystem>(vfs, instance_state.mount_table));
+	}
+	result.Reference(Value(SUCCESS), count_t(args.size()));
+}
+
+void Unmount(const DataChunk &args, ExpressionState &state, Vector &result) {
+	ALWAYS_ASSERT(args.ColumnCount() == 1);
+	const string local_prefix = args.GetValue(/*col_idx=*/0, /*index=*/0).ToString();
+	auto &instance_state = GetInstanceStateOrThrow(GetDatabaseInstance(state));
+	result.Reference(Value::BOOLEAN(instance_state.mount_table->Remove(local_prefix)), count_t(args.size()));
+}
+
 void WrapCacheFileSystem(const DataChunk &args, ExpressionState &state, Vector &result) {
 	ALWAYS_ASSERT(args.ColumnCount() == 1);
 	const string filesystem_name = args.GetValue(/*col_idx=*/0, /*index=*/0).ToString();
@@ -339,6 +367,27 @@ void RegisterCacheHttpfsFunctions(ExtensionLoader &loader) {
 	                       /*description=*/"Wraps a registered DuckDB filesystem with the cache filesystem.",
 	                       /*examples=*/ {"SELECT cache_httpfs_wrap_cache_filesystem('AzureBlobStorageFileSystem');"},
 	                       /*categories=*/ {"cache_httpfs", "filesystem"});
+
+	// Register mounts. Functions rather than a setting, so they still work under lock_configuration. Volatile, since they
+	// change the instance's state.
+	ScalarFunction mount_func("cache_httpfs_mount", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                          Mount);
+	mount_func.SetVolatile();
+	RegisterScalarFunction(loader, std::move(mount_func),
+	                       /*parameter_names=*/ {"local_prefix", "remote_prefix"},
+	                       /*description=*/
+	                       "Serves paths under a local prefix from a remote one, through the cache and under the remote "
+	                       "path. Lets a reader run on a local folder that holds only part of something.",
+	                       /*examples=*/ {"SELECT cache_httpfs_mount('/data/table', 's3://bucket/table');"},
+	                       /*categories=*/ {"cache_httpfs", "configuration"});
+
+	ScalarFunction unmount_func("cache_httpfs_unmount", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, Unmount);
+	unmount_func.SetVolatile();
+	RegisterScalarFunction(loader, std::move(unmount_func),
+	                       /*parameter_names=*/ {"local_prefix"},
+	                       /*description=*/ "Removes a mount, and says whether there was one.",
+	                       /*examples=*/ {"SELECT cache_httpfs_unmount('/data/table');"},
+	                       /*categories=*/ {"cache_httpfs", "configuration"});
 
 	// Register the offline switch. A function rather than a setting, so it still works under lock_configuration.
 	// Volatile, since it changes the instance's state, as wrapping does.

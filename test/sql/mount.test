@@ -1,0 +1,73 @@
+# name: test/sql/mount.test
+# description: paths under a mounted prefix are served from where it points
+# group: [sql]
+
+require cache_httpfs
+
+require parquet
+
+statement ok
+COPY (SELECT 42 AS answer) TO '__TEST_DIR__/mounted_file.parquet' (FORMAT parquet);
+
+# Nothing is mounted yet, and the folder doesn't exist.
+statement error
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_file.parquet');
+----
+
+query I
+SELECT cache_httpfs_mount('__TEST_DIR__/mount_point', '__TEST_DIR__');
+----
+true
+
+query I
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_file.parquet');
+----
+42
+
+# A glob too.
+query I
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_*.parquet');
+----
+42
+
+# A whole path segment: a sibling that begins the same isn't under it.
+statement error
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point2/mounted_file.parquet');
+----
+
+# Mounted again, and with a trailing slash, it's the same mount.
+query I
+SELECT cache_httpfs_mount('__TEST_DIR__/mount_point/', '__TEST_DIR__/');
+----
+true
+
+query I
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_file.parquet');
+----
+42
+
+query I
+SELECT cache_httpfs_unmount('__TEST_DIR__/mount_point');
+----
+true
+
+query I
+SELECT cache_httpfs_unmount('__TEST_DIR__/mount_point');
+----
+false
+
+statement error
+SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_file.parquet');
+----
+
+# A mount can't reach what the database isn't allowed to.
+statement ok
+SET allowed_directories = ['__TEST_DIR__/mount_point'];
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT cache_httpfs_mount('__TEST_DIR__/mount_point', '__TEST_DIR__');
+----
+is not allowed

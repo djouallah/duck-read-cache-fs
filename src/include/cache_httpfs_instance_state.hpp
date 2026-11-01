@@ -6,6 +6,7 @@
 #include <atomic>
 #include <string_view>
 
+#include "mount_filesystem.hpp"
 #include "base_cache_reader.hpp"
 #include "base_profile_collector.hpp"
 #include "cache_exclusion_manager.hpp"
@@ -181,6 +182,8 @@ struct CacheHttpfsInstanceState : public ObjectCacheEntry {
 	InstanceCacheReaderManager cache_reader_manager;
 	InstanceProfileCollectorManager profile_collector_manager;
 	CacheExclusionManager exclusion_manager;
+	// What cache_httpfs_mount has mounted.
+	shared_ptr<MountTable> mount_table = make_shared_ptr<MountTable>();
 	// Set by cache_httpfs_set_offline: opening a file never reaches the real filesystem (offline_file.hpp).
 	std::atomic<bool> offline {false};
 	// Set the first time cache_httpfs_set_offline is called: what a file's open answered is kept from then on.
