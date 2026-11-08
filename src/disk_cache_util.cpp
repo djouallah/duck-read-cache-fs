@@ -84,8 +84,9 @@ void ForgetCacheFile(const string &filepath) {
 	FileMemo().erase(filepath);
 }
 
-// [DiskCacheUtil::ValidateCacheFile], trusted for a minute once true.
-bool ValidateCacheFileMemoized(const string &filepath, const string &version_tag) {
+// [validate] (DiskCacheUtil::ValidateCacheFile, passed in by its own members), trusted for a minute once true.
+bool ValidateCacheFileMemoized(const string &filepath, const string &version_tag,
+                               bool (*validate)(const string &, const string &)) {
 	if (version_tag.empty()) {
 		return true;
 	}
@@ -98,7 +99,7 @@ bool ValidateCacheFileMemoized(const string &filepath, const string &version_tag
 			return true;
 		}
 	}
-	if (!DiskCacheUtil::ValidateCacheFile(filepath, version_tag)) {
+	if (!validate(filepath, version_tag)) {
 		const std::lock_guard<std::mutex> lck(FileMemoMutex());
 		FileMemo().erase(filepath);
 		return false;
@@ -374,7 +375,8 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	}
 
 	// Check cache validity and clear if necessary.
-	if (file_handle != nullptr && !ValidateCacheFileMemoized(cache_filepath, version_tag)) {
+	if (file_handle != nullptr &&
+	    !ValidateCacheFileMemoized(cache_filepath, version_tag, &DiskCacheUtil::ValidateCacheFile)) {
 		local_filesystem.TryRemoveFile(cache_filepath);
 		file_handle = nullptr;
 	}
@@ -410,7 +412,7 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	if (file_handle == nullptr) {
 		return false;
 	}
-	if (!ValidateCacheFileMemoized(cache_filepath, version_tag)) {
+	if (!ValidateCacheFileMemoized(cache_filepath, version_tag, &DiskCacheUtil::ValidateCacheFile)) {
 		local_filesystem.TryRemoveFile(cache_filepath);
 		return false;
 	}
