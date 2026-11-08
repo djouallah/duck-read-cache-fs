@@ -173,7 +173,22 @@ void DiskCacheReader::ProcessCacheReadChunk(FileHandle &handle, const InstanceCo
 	// TODO(hjiang): With in-memory cache block involved, we could place disk write to background thread.
 	// Check local disk access before serving from cache.
 	const bool can_access_cache_file = state->CanAccessFile(cache_dest.dest_local_filepath);
-	if (can_access_cache_file) {
+	if (can_access_cache_file && in_mem_storage == nullptr) {
+		// Nothing keeps the block in memory, so only the bytes asked for are read. A scan asks for a few KB at a time,
+		// and reading the whole block for each read made a 9 GB table cost hundreds of GB read off the disk.
+		const auto latency_guard = collector.RecordOperationStart(IoOperation::kDiskCacheRead);
+		const idx_t delta_offset = cache_read_chunk.requested_start_offset - cache_read_chunk.aligned_start_offset;
+		if (DiskCacheUtil::ReadLocalCacheRange(cache_dest.dest_local_filepath, delta_offset,
+		                                       cache_read_chunk.bytes_to_copy, cache_read_chunk.requested_start_addr,
+		                                       version_tag)) {
+			collector.RecordCacheAccess(CacheEntity::kData, CacheAccess::kCacheHit, cache_read_chunk.bytes_to_copy);
+			DUCKDB_LOG_READ_CACHE_HIT((handle));
+			if (config.on_disk_eviction_policy == *ON_DISK_LRU_SINGLE_PROC_EVICTION) {
+				UpsertCacheFileAccessTimestamp(cache_dest.dest_local_filepath);
+			}
+			return;
+		}
+	} else if (can_access_cache_file) {
 		const auto latency_guard = collector.RecordOperationStart(IoOperation::kDiskCacheRead);
 		const DiskCacheUtil::ReadOption read_options {
 		    // If on-disk in-memory cache is enabled, use direct IO to avoid double buffering.

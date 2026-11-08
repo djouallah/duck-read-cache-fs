@@ -1,7 +1,9 @@
 #include "disk_cache_util.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <string_view>
+#include <unordered_map>
 
 #include "duckdb/common/assert.hpp"
 #include "cache_filesystem_config.hpp"
@@ -42,6 +44,88 @@ constexpr std::string_view CACHE_FILEPATH_ATTR_PREFIX = "user.cache_httpfs_cache
 
 // xattr key prefix for storing chunked original remote/source file path.
 constexpr std::string_view REMOTE_PATH_ATTR_PREFIX = "user.cache_httpfs_remote_path";
+
+// What this process already knows of its cache files, so a read doesn't pay for it every time. A scan reads a
+// block many times, a few KB each, and each read checked the block's version tag (on Windows: opening its
+// alternate data stream) and brought its timestamps forward (opening it to write): thousands of opens a second.
+// A tag found valid is trusted for a minute, and timestamps move at most every ten minutes, which is all the
+// time-based eviction needs. A file removed as stale is forgotten. Data files of Delta and Iceberg tables are
+// never rewritten under their name, so a minute's trust can't serve another file's bytes for them.
+constexpr int64_t VALIDATED_FOR_MICROSEC = 60LL * 1000 * 1000;
+constexpr int64_t TOUCH_EVERY_MICROSEC = 10LL * 60 * 1000 * 1000;
+constexpr size_t FILE_MEMO_MAX_ENTRIES = 1 << 17;
+
+struct CacheFileMemo {
+	string version_tag;
+	int64_t validated_at = -1;
+	int64_t touched_at = -1;
+};
+
+std::mutex &FileMemoMutex() {
+	static std::mutex mtx;
+	return mtx;
+}
+std::unordered_map<string, CacheFileMemo> &FileMemo() {
+	static std::unordered_map<string, CacheFileMemo> memo;
+	return memo;
+}
+// The entry for [filepath], made if missing; the map starts over once it is this big. Caller holds the mutex.
+CacheFileMemo &FileMemoEntry(const string &filepath) {
+	auto &memo = FileMemo();
+	if (memo.size() >= FILE_MEMO_MAX_ENTRIES && memo.find(filepath) == memo.end()) {
+		memo.clear();
+	}
+	return memo[filepath];
+}
+
+// A cache file written again: what was known of the one before goes with it.
+void ForgetCacheFile(const string &filepath) {
+	const std::lock_guard<std::mutex> lck(FileMemoMutex());
+	FileMemo().erase(filepath);
+}
+
+// [DiskCacheUtil::ValidateCacheFile], trusted for a minute once true.
+bool ValidateCacheFileMemoized(const string &filepath, const string &version_tag) {
+	if (version_tag.empty()) {
+		return true;
+	}
+	const int64_t now = Timestamp::GetCurrentTimestamp().value;
+	{
+		const std::lock_guard<std::mutex> lck(FileMemoMutex());
+		const auto it = FileMemo().find(filepath);
+		if (it != FileMemo().end() && it->second.version_tag == version_tag &&
+		    now - it->second.validated_at < VALIDATED_FOR_MICROSEC) {
+			return true;
+		}
+	}
+	if (!DiskCacheUtil::ValidateCacheFile(filepath, version_tag)) {
+		const std::lock_guard<std::mutex> lck(FileMemoMutex());
+		FileMemo().erase(filepath);
+		return false;
+	}
+	const std::lock_guard<std::mutex> lck(FileMemoMutex());
+	auto &entry = FileMemoEntry(filepath);
+	entry.version_tag = version_tag;
+	entry.validated_at = now;
+	return true;
+}
+
+// [UpdateFileTimestamps], at most every ten minutes per file.
+void TouchCacheFileThrottled(const string &filepath) {
+	const int64_t now = Timestamp::GetCurrentTimestamp().value;
+	{
+		const std::lock_guard<std::mutex> lck(FileMemoMutex());
+		const auto it = FileMemo().find(filepath);
+		if (it != FileMemo().end() && it->second.touched_at >= 0 && now - it->second.touched_at < TOUCH_EVERY_MICROSEC) {
+			return;
+		}
+	}
+	// Intentionally ignore the return value, since it's possible the cache file has been requested to delete by
+	// another eviction thread.
+	UpdateFileTimestamps(filepath);
+	const std::lock_guard<std::mutex> lck(FileMemoMutex());
+	FileMemoEntry(filepath).touched_at = now;
+}
 
 // Reconstruct a string value from chunked xattr entries with the given key prefix.
 // Returns empty string if no attributes are found.
@@ -258,6 +342,7 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	// Issue reference: https://github.com/dentiny/duck-read-cache-fs/issues/422
 	local_filesystem.MoveFile(/*source=*/cache_dest.temp_local_filepath,
 	                          /*target=*/cache_dest.dest_local_filepath);
+	ForgetCacheFile(cache_dest.dest_local_filepath);
 }
 
 /*static*/ DiskCacheUtil::LocalCacheReadResult DiskCacheUtil::ReadLocalCacheFile(const string &cache_filepath,
@@ -289,7 +374,7 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	}
 
 	// Check cache validity and clear if necessary.
-	if (file_handle != nullptr && !ValidateCacheFile(cache_filepath, version_tag)) {
+	if (file_handle != nullptr && !ValidateCacheFileMemoized(cache_filepath, version_tag)) {
 		local_filesystem.TryRemoveFile(cache_filepath);
 		file_handle = nullptr;
 	}
@@ -303,14 +388,39 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	content.length = chunk_size;
 
 	// Update access and modification timestamp for the cache file, so it won't get evicted.
-	// Intentionally ignore the return value, since it's possible the cache file has been requested to
-	// delete by another eviction thread.
-	UpdateFileTimestamps(cache_filepath);
+	TouchCacheFileThrottled(cache_filepath);
 
 	return LocalCacheReadResult {
 	    .cache_hit = true,
 	    .content = std::move(content),
 	};
+}
+
+/*static*/ bool DiskCacheUtil::ReadLocalCacheRange(const string &cache_filepath, idx_t offset, idx_t nr_bytes,
+                                                   char *dest, const string &version_tag) {
+	LocalFileSystem local_filesystem {};
+	// As [ReadLocalCacheFile]: a file that can't be opened, or is shorter than asked, is a miss.
+	unique_ptr<FileHandle> file_handle;
+	try {
+		file_handle = local_filesystem.OpenFile(cache_filepath,
+		                                        FileOpenFlags::FILE_FLAGS_READ | FileOpenFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+	} catch (const std::exception &) {
+		return false;
+	}
+	if (file_handle == nullptr) {
+		return false;
+	}
+	if (!ValidateCacheFileMemoized(cache_filepath, version_tag)) {
+		local_filesystem.TryRemoveFile(cache_filepath);
+		return false;
+	}
+	try {
+		local_filesystem.Read(*file_handle, dest, nr_bytes, offset);
+	} catch (const std::exception &) {
+		return false;
+	}
+	TouchCacheFileThrottled(cache_filepath);
+	return true;
 }
 
 /*static*/ bool DiskCacheUtil::ValidateCacheFile(const string &cache_filepath, const string &version_tag) {

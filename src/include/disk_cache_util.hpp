@@ -123,6 +123,12 @@ public:
 	static LocalCacheReadResult ReadLocalCacheFile(const string &cache_filepath, idx_t chunk_size,
 	                                               const string &version_tag, const ReadOption &options);
 
+	// Read [nr_bytes] at [offset] of the local cache file at [cache_filepath] into [dest], validated as
+	// [ReadLocalCacheFile] does. Returns whether it was a hit; on a miss [dest] holds nothing to rely on. For a read
+	// whose block isn't kept in memory: it reads what was asked, not the whole block.
+	static bool ReadLocalCacheRange(const string &cache_filepath, idx_t offset, idx_t nr_bytes, char *dest,
+	                                const string &version_tag);
+
 	// Remove dead temporary cache files (write-to-temp-then-swap leftovers) under [cache_directories].
 	// Returns the number of files deleted.
 	// [db] and [mode] are optional; when [db] is nullptr the private thread pool is always used.
