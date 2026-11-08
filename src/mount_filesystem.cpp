@@ -1,5 +1,6 @@
 #include "mount_filesystem.hpp"
 
+#include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/string_util.hpp"
 
 #include <algorithm>
@@ -87,7 +88,15 @@ bool MountTable::FirstUse() {
 }
 
 MountFileSystem::MountFileSystem(FileSystem &vfs_p, shared_ptr<MountTable> table_p)
-    : vfs(vfs_p), table(std::move(table_p)) {
+    : vfs(vfs_p), table(std::move(table_p)), local(FileSystem::CreateLocal()) {
+}
+
+bool MountFileSystem::IsHere(const string &path) {
+	try {
+		return local->FileExists(path);
+	} catch (const std::exception &) {
+		return false;
+	}
 }
 
 string MountFileSystem::Resolved(const string &path) const {
@@ -103,18 +112,24 @@ bool MountFileSystem::CanHandleFile(const string &fpath) {
 
 unique_ptr<FileHandle> MountFileSystem::OpenFile(const string &path, FileOpenFlags flags,
                                                  optional_ptr<FileOpener> opener) {
+	if (IsHere(path)) {
+		return local->OpenFile(path, flags, opener);
+	}
 	return vfs.OpenFile(Resolved(path), flags, opener);
 }
 
 unique_ptr<FileHandle> MountFileSystem::OpenFileExtended(const OpenFileInfo &file, FileOpenFlags flags,
                                                          optional_ptr<FileOpener> opener) {
+	if (IsHere(file.path)) {
+		return local->OpenFile(file.path, flags, opener);
+	}
 	OpenFileInfo resolved(file);
 	resolved.path = Resolved(file.path);
 	return vfs.OpenFile(resolved, flags, opener);
 }
 
 bool MountFileSystem::FileExists(const string &filename, optional_ptr<FileOpener> opener) {
-	return vfs.FileExists(Resolved(filename), opener);
+	return IsHere(filename) || vfs.FileExists(Resolved(filename), opener);
 }
 
 bool MountFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
@@ -131,6 +146,9 @@ vector<OpenFileInfo> MountFileSystem::Glob(const string &path, FileOpener *opene
 }
 
 optional<FileMetadata> MountFileSystem::GetStatsIfExists(const OpenFileInfo &file, optional_ptr<FileOpener> opener) {
+	if (IsHere(file.path)) {
+		return local->GetStatsIfExists(file, opener);
+	}
 	OpenFileInfo resolved(file);
 	resolved.path = Resolved(file.path);
 	return vfs.GetStatsIfExists(resolved, opener);

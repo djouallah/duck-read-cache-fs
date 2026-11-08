@@ -1,6 +1,10 @@
 // A mount: paths under a local prefix are served from a remote one. A reader can then be pointed at a local folder
 // that holds only part of something, with everything else read from where it really is, through the cache like any
 // other remote read and under the remote path, so what's already cached is found. It's added by cache_httpfs_mount.
+//
+// A file that is really there under the mount is read where it is, with the local filesystem: a whole file kept on
+// this machine reads at the disk's speed, with no cache in between and no request. A file is only ever put there
+// whole (written beside and renamed in), and what's under the mount is never written through it.
 
 #pragma once
 
@@ -60,9 +64,12 @@ protected:
 
 private:
 	string Resolved(const string &path) const;
+	// Whether [path] is a file on this machine, read where it is.
+	bool IsHere(const string &path);
 
 	FileSystem &vfs;
 	shared_ptr<MountTable> table;
+	unique_ptr<FileSystem> local;
 };
 
 } // namespace duckdb

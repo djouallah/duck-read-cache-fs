@@ -60,6 +60,37 @@ statement error
 SELECT answer FROM read_parquet('__TEST_DIR__/mount_point/mounted_file.parquet');
 ----
 
+# A file that is really there under a mount is read where it is (a whole file kept on this machine), even where the
+# mount points has one of that name; a file that isn't there is read from where the mount points.
+statement ok
+COPY (SELECT 7 AS answer, 1 AS p) TO '__TEST_DIR__/kept' (FORMAT parquet, PARTITION_BY (p), OVERWRITE_OR_IGNORE true);
+
+statement ok
+COPY (SELECT 8 AS answer, 1 AS p) TO '__TEST_DIR__/far' (FORMAT parquet, PARTITION_BY (p), OVERWRITE_OR_IGNORE true);
+
+statement ok
+COPY (SELECT 9 AS answer, 2 AS p) TO '__TEST_DIR__/far' (FORMAT parquet, PARTITION_BY (p), OVERWRITE_OR_IGNORE true);
+
+query I
+SELECT cache_httpfs_mount('__TEST_DIR__/kept', '__TEST_DIR__/far');
+----
+true
+
+query I
+SELECT answer FROM read_parquet('__TEST_DIR__/kept/p=1/data_0.parquet');
+----
+7
+
+query I
+SELECT answer FROM read_parquet('__TEST_DIR__/kept/p=2/data_0.parquet');
+----
+9
+
+query I
+SELECT cache_httpfs_unmount('__TEST_DIR__/kept');
+----
+true
+
 # A mount can't reach what the database isn't allowed to.
 statement ok
 SET allowed_directories = ['__TEST_DIR__/mount_point'];
