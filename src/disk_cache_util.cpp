@@ -277,7 +277,16 @@ DiskCacheUtil::GetLocalCacheFile(const RemoteFileCachePathInfo &path_info, idx_t
 	// On all platform, DuckDB opens option guarantee reference counting, which means even if the file is requested to
 	// delete, already-opened file handle could still be accessed with no problem.
 	// Reference: https://github.com/duckdb/duckdb/pull/19782
-	auto file_handle = local_filesystem.OpenFile(cache_filepath, file_open_flags);
+	//
+	// A cache file that can't be opened is a cache miss, never a failed read: the caller reads the remote file instead.
+	// On Windows, opening a file while another writer's MoveFile replaces it (two readers that missed the same block
+	// both publish it) fails with "Access is denied" until the replaced file is gone.
+	unique_ptr<FileHandle> file_handle;
+	try {
+		file_handle = local_filesystem.OpenFile(cache_filepath, file_open_flags);
+	} catch (const std::exception &) {
+		return LocalCacheReadResult {};
+	}
 
 	// Check cache validity and clear if necessary.
 	if (file_handle != nullptr && !ValidateCacheFile(cache_filepath, version_tag)) {
