@@ -142,6 +142,11 @@ bool MountFileSystem::ListFiles(const string &directory, const std::function<voi
 }
 
 vector<OpenFileInfo> MountFileSystem::Glob(const string &path, FileOpener *opener) {
+	// A reader expands its path first and opens what comes back: a file that's here comes back as itself, or the
+	// remote path it resolves to is what gets opened.
+	if (!FileSystem::HasGlob(path) && IsHere(path)) {
+		return {OpenFileInfo(path)};
+	}
 	return vfs.Glob(Resolved(path), opener);
 }
 
